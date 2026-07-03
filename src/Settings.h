@@ -21,20 +21,27 @@ class Settings {
 public:
   Settings() :
     mute(false),
-    mouse_sensitivity(0) {
+    mouse_sensitivity(0),
+    shadows(1),
+    quality(2) {
   }
 
+  // NOTE: the original code wrote sizeof(this) (= pointer size, 8 bytes) which
+  // by pure luck matched the old struct size. Fixed to sizeof(Settings); an old
+  // 8-byte settings file still loads its two fields, the rest keep defaults.
   void Load(const std::string& fname) {
     std::ifstream fin(fname, std::ios::binary);
     if (!fin) { return; }
-    fin.read((char*)this, sizeof(this));
+    fin.read((char*)this, sizeof(Settings));
   }
   void Save(const std::string& fname) {
     std::ofstream fout(fname, std::ios::binary);
     if (!fout) { return; }
-    fout.write((char*)this, sizeof(this));
+    fout.write((char*)this, sizeof(Settings));
   }
 
   bool   mute;
   int    mouse_sensitivity;
+  int    shadows;   // 0 = off, 1 = on
+  int    quality;   // 0 = low, 1 = medium, 2 = high
 };

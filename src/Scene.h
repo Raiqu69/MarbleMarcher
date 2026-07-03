@@ -16,15 +16,18 @@
 */
 #pragma once
 #include "Level.h"
+#include "Fractals.h"
 #include <SFML/Audio.hpp>
 #include <SFML/Graphics.hpp>
 #include <Eigen/Dense>
+#include <optional>
 
 class Scene {
 public:
   enum CamMode {
     INTRO,
     SCREEN_SAVER,
+    FREE_FLY,
     ORBIT,
     DEORBIT,
     MARBLE,
@@ -67,6 +70,17 @@ public:
 
   void UpdateMarble(float dx=0.0f, float dy=0.0f);
   void UpdateCamera(float dx=0.0f, float dy=0.0f, float dz=0.0f, bool speedup=false);
+  void UpdateFreeFlyCam(float look_dx, float look_dy, float move_lr, float move_ud, float move_fb, float sprint_mult, float zoom_delta);
+  void SetFractal(const FractalDef& def);
+  void SetFlySpeedLevel(int level);
+  int  GetFlySpeedLevel() const { return fly_speed_level; }
+  float GetFov() const { return fly_fov; }
+  int  GetShaderSel() const { return fractal_type; }
+  bool PopShaderDirty() { const bool d = shader_dirty; shader_dirty = false; return d; }
+  void ToggleDrift() { drift_on = !drift_on; }
+  bool IsDrifting() const { return drift_on; }
+  void AdjustParam(int idx, float dir);
+  const FractalParams& GetParams() const { return frac_params; }
 
   void SnapCamera();
   void HideObjects();
@@ -74,6 +88,7 @@ public:
   void Write(sf::Shader& shader) const;
 
   float DE(const Eigen::Vector3f& pt) const;
+  float DE_Fly(const Eigen::Vector3f& pt) const;
   Eigen::Vector3f NP(const Eigen::Vector3f& pt) const;
   bool MarbleCollision(float& delta_v);
 
@@ -91,6 +106,7 @@ protected:
   void SetLevel(int level);
 
   void UpdateIntro(bool ssaver);
+  void UpdateScreenSaver(float dx, float dy, float dz);
   void UpdateOrbit();
   void UpdateDeOrbit(float dx, float dy, float dz);
   void UpdateNormal(float dx, float dy, float dz);
@@ -132,19 +148,29 @@ private:
   int             sum_time;
   float           exposure;
 
-  sf::Sound sound_goal;
   sf::SoundBuffer buff_goal;
-  sf::Sound sound_bounce1;
+  std::optional<sf::Sound> sound_goal;
   sf::SoundBuffer buff_bounce1;
-  sf::Sound sound_bounce2;
+  std::optional<sf::Sound> sound_bounce1;
   sf::SoundBuffer buff_bounce2;
-  sf::Sound sound_bounce3;
+  std::optional<sf::Sound> sound_bounce2;
   sf::SoundBuffer buff_bounce3;
-  sf::Sound sound_shatter;
+  std::optional<sf::Sound> sound_bounce3;
   sf::SoundBuffer buff_shatter;
+  std::optional<sf::Sound> sound_shatter;
 
   sf::Music* music;
 
+  int             fractal_type;    // active ShaderSel, 0 = game fractal
+  bool            shader_dirty;    // fractal_type changed -> shader recompile
+  int             fly_speed_level; // 0 = auto (DE-adaptive), 1-9 manual
+  int             fly_iters;       // adaptive fold iterations (more when close)
+  Eigen::Vector3f fly_vel;
+  float           fly_fov;         // vertical FOV in degrees (5-170)
+  float           fly_fov_vel;
+  bool            drift_on;        // slow psychedelic parameter drift
+  float           drift_t;
+  float           anim_t;          // free-running clock (drives 4D tesseract)
   bool            enable_cheats;
   bool            free_camera;
   int             gravity_type;

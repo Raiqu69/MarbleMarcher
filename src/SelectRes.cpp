@@ -1,18 +1,9 @@
 /* This file is part of the Marble Marcher (https://github.com/HackerPoet/MarbleMarcher).
-* Copyright(C) 2018 CodeParade
-* 
+*
 * This program is free software: you can redistribute it and/or modify
 * it under the terms of the GNU General Public License as published by
 * the Free Software Foundation, either version 2 of the License, or
 * (at your option) any later version.
-* 
-* This program is distributed in the hope that it will be useful,
-* but WITHOUT ANY WARRANTY; without even the implied warranty of
-* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-* GNU General Public License for more details.
-* 
-* You should have received a copy of the GNU General Public License
-* along with this program.If not, see <http://www.gnu.org/licenses/>.
 */
 #include "SelectRes.h"
 #include "Res.h"
@@ -24,12 +15,14 @@ const Resolution all_resolutions[num_resolutions] = {
   Resolution(1280, 720, "GTX 980 or similar:"),
   Resolution(1600, 900, "GTX 1080 or similar:"),
   Resolution(1920, 1080, "GTX 1080 Ti or similar:"),
-  Resolution(2560, 1440, "RTX 2080 Ti or higher:")
+  Resolution(2560, 1440, "RTX 2080 Ti or higher:"),
+  Resolution(3840, 2160, "RTX 3080 / RTX 5070 or similar:"),
+  Resolution(5120, 2880, "RTX 4090 / RTX 5080 or higher:")
 };
 
 SelectRes::SelectRes(const sf::Font* _font) : font(_font), is_fullscreen(false) {
-  buff_hover.loadFromFile(menu_hover_wav);
-  sound_hover.setBuffer(buff_hover);
+  (void)buff_hover.loadFromFile(menu_hover_wav);
+  sound_hover.emplace(buff_hover);
 }
 
 int SelectRes::Select(const sf::Vector2i& mouse_pos) {
@@ -56,27 +49,26 @@ void SelectRes::Draw(sf::RenderWindow& window, const sf::Vector2i& mouse_pos) {
     window.draw(MakeText(res_str.c_str(), 390.0f, y, 42, is_sel, false));
   }
   const char* ftxt = (is_fullscreen ? "Full Screen [X]" : "Full Screen [ ]");
-  window.draw(MakeText(ftxt, 320.0f, 530.0f, 40, sel_ix == num_resolutions));
+  window.draw(MakeText(ftxt, 320.0f, 530.0f + float(num_resolutions - 7) * 60.0f, 40, sel_ix == num_resolutions));
 }
 
 sf::Text SelectRes::MakeText(const char* str, float x, float y, int size, bool selected, bool centered) const {
-  sf::Text text;
+  sf::Text text(*font);
   text.setString(str);
-  text.setFont(*font);
   text.setCharacterSize(size);
   text.setLetterSpacing(0.8f);
-  text.setPosition(x, y);
+  text.setPosition({x, y});
   text.setFillColor(selected ? sf::Color::White : sf::Color(128,128,128));
   if (centered) {
     const sf::FloatRect text_bounds = text.getLocalBounds();
-    text.setOrigin(text_bounds.width / 2, text_bounds.height / 2);
+    text.setOrigin({text_bounds.size.x / 2, text_bounds.size.y / 2});
   }
   return text;
 }
 
 const Resolution* SelectRes::Run() {
   //Create the window
-  sf::VideoMode window_size(640, 600, 24);
+  sf::VideoMode window_size({640u, 620u + (unsigned)(num_resolutions - 7) * 60u});
   sf::RenderWindow window(window_size, "Marble Marcher", sf::Style::Close);
   window.setVerticalSyncEnabled(true);
   window.requestFocus();
@@ -85,20 +77,17 @@ const Resolution* SelectRes::Run() {
   const Resolution* res = nullptr;
   int prev_ix = -1;
   while (window.isOpen()) {
-    sf::Event event;
-    while (window.pollEvent(event)) {
-      if (event.type == sf::Event::Closed) {
+    while (const auto event = window.pollEvent()) {
+      if (event->is<sf::Event::Closed>()) {
         window.close();
         break;
-      } else if (event.type == sf::Event::KeyPressed) {
-        const sf::Keyboard::Key keycode = event.key.code;
-        if (event.key.code < 0 || event.key.code >= sf::Keyboard::KeyCount) { continue; }
-        if (keycode == sf::Keyboard::Escape) {
+      } else if (const auto* keyEvent = event->getIf<sf::Event::KeyPressed>()) {
+        if (keyEvent->code == sf::Keyboard::Key::Escape) {
           window.close();
           break;
         }
-      } else if (event.type == sf::Event::MouseButtonPressed) {
-        mouse_pos = sf::Vector2i(event.mouseButton.x, event.mouseButton.y);
+      } else if (const auto* mbEvent = event->getIf<sf::Event::MouseButtonPressed>()) {
+        mouse_pos = mbEvent->position;
         const int sel_ix = Select(mouse_pos);
         if (sel_ix >= 0 && sel_ix < num_resolutions) {
           res = &all_resolutions[sel_ix];
@@ -106,13 +95,13 @@ const Resolution* SelectRes::Run() {
         } else if (sel_ix == num_resolutions) {
           is_fullscreen = !is_fullscreen;
         }
-      } else if (event.type == sf::Event::MouseButtonReleased) {
-        mouse_pos = sf::Vector2i(event.mouseButton.x, event.mouseButton.y);
-      } else if (event.type == sf::Event::MouseMoved) {
-        mouse_pos = sf::Vector2i(event.mouseMove.x, event.mouseMove.y);
+      } else if (const auto* mbEvent = event->getIf<sf::Event::MouseButtonReleased>()) {
+        mouse_pos = mbEvent->position;
+      } else if (const auto* mmEvent = event->getIf<sf::Event::MouseMoved>()) {
+        mouse_pos = mmEvent->position;
         int hover_ix = Select(mouse_pos);
         if (hover_ix >= 0 && hover_ix != prev_ix) {
-          sound_hover.play();
+          sound_hover->play();
         }
         prev_ix = hover_ix;
       }

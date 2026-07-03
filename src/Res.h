@@ -20,6 +20,7 @@
 static const int num_level_music = 4;
 static const char vert_glsl[] = "assets/vert.glsl";
 static const char frag_glsl[] = "assets/frag.glsl";
+static const char frag2d_glsl[] = "assets/frag2d.glsl";
 static const char Orbitron_Bold_ttf[] = "assets/Orbitron-Bold.ttf";
 static const char Inconsolata_Bold_ttf[] = "assets/Inconsolata-Bold.ttf";
 static const char menu_ogg[] = "assets/menu.ogg";

@@ -17,6 +17,7 @@
 #pragma once
 #include <SFML/Graphics.hpp>
 #include <SFML/Audio.hpp>
+#include <optional>
 
 struct Resolution {
   Resolution(int w, int h, const char* i) : width(w), height(h), info(i) {}
@@ -24,7 +25,7 @@ struct Resolution {
   int height;
   const char* info;
 };
-static const int num_resolutions = 7;
+static const int num_resolutions = 9;
 const extern Resolution all_resolutions[num_resolutions];
 
 class SelectRes {
@@ -43,6 +44,6 @@ private:
 
   bool is_fullscreen;
 
-  sf::Sound sound_hover;
   sf::SoundBuffer buff_hover;
+  std::optional<sf::Sound> sound_hover;
 };

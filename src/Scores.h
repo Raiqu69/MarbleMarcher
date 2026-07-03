@@ -24,7 +24,7 @@ public:
   Scores() { memset(this, -1, sizeof(Scores)); }
 
   bool HasUnlocked(int level) const {
-    return level <= 0 || scores[level - 1] >= 0;
+    return true;
   }
   bool HasCompleted(int level) const {
     return scores[level] >= 0;

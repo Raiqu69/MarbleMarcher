@@ -43,6 +43,26 @@ static const float ground_ratio = 1.15f;
 static const int mus_switches[num_level_music] = {9, 15, 21, 24};
 static const int num_levels_midpoint = 15;
 
+// Free-fly speed levels (key 1 = fastest, key 9 = slowest).
+// Key 0 = AUTO: speed adapts to the distance from the fractal surface.
+// Each step ÷3 → level 9 is ~6500× slower than level 1 (gottlos langsam)
+static const float FLY_SPEEDS[10] = {
+    0.0f,      // 0: unused (auto mode)
+    1.30e-3f,  // 1: fastest
+    4.33e-4f,  // 2
+    1.44e-4f,  // 3
+    4.81e-5f,  // 4
+    1.60e-5f,  // 5
+    5.34e-6f,  // 6
+    1.78e-6f,  // 7
+    5.93e-7f,  // 8
+    1.98e-7f,  // 9: gottlos langsam
+};
+// Auto mode: speed = DE * factor, clamped. Sprint still multiplies on top.
+static const float auto_speed_factor = 0.025f;
+static const float auto_speed_min    = 2e-7f;
+static const float auto_speed_max    = 0.04f;
+
 static void ModPi(float& a, float b) {
   if (a - b > pi) {
     a -= 2 * pi;
@@ -70,22 +90,32 @@ Scene::Scene(sf::Music* level_music) :
   timer(0),
   sum_time(0),
   music(level_music),
-  cur_level(0)
+  cur_level(0),
+  fractal_type(0),
+  shader_dirty(false),
+  fly_speed_level(0),
+  fly_iters(24),
+  fly_vel(0.0f, 0.0f, 0.0f),
+  fly_fov(90.0f),
+  fly_fov_vel(0.0f),
+  drift_on(false),
+  drift_t(0.0f),
+  anim_t(0.0f)
 {
   ResetCheats();
   frac_params.setOnes();
   frac_params_smooth.setOnes();
   SnapCamera();
-  buff_goal.loadFromFile(goal_wav);
-  sound_goal.setBuffer(buff_goal);
-  buff_bounce1.loadFromFile(bounce1_wav);
-  sound_bounce1.setBuffer(buff_bounce1);
-  buff_bounce2.loadFromFile(bounce2_wav);
-  sound_bounce2.setBuffer(buff_bounce2);
-  buff_bounce3.loadFromFile(bounce3_wav);
-  sound_bounce3.setBuffer(buff_bounce3);
-  buff_shatter.loadFromFile(shatter_wav);
-  sound_shatter.setBuffer(buff_shatter);
+  (void)buff_goal.loadFromFile(goal_wav);
+  sound_goal.emplace(buff_goal);
+  (void)buff_bounce1.loadFromFile(bounce1_wav);
+  sound_bounce1.emplace(buff_bounce1);
+  (void)buff_bounce2.loadFromFile(bounce2_wav);
+  sound_bounce2.emplace(buff_bounce2);
+  (void)buff_bounce3.loadFromFile(bounce3_wav);
+  sound_bounce3.emplace(buff_bounce3);
+  (void)buff_shatter.loadFromFile(shatter_wav);
+  sound_shatter.emplace(buff_shatter);
 }
 
 void Scene::LoadLevel(int level) {
@@ -119,7 +149,61 @@ void Scene::SetMode(CamMode mode) {
     timer = 0;
     intro_needs_snap = true;
   }
+  if (mode == SCREEN_SAVER) {
+    cam_dist = 10.0f;
+    cam_dist_smooth = 10.0f;
+  }
+  if (mode == FREE_FLY) {
+    fly_speed_level = 0;  // auto speed
+    fly_vel.setZero();
+    fly_fov = 90.0f;
+    fly_fov_vel = 0.0f;
+    cam_pos = cam_pos_smooth;
+    SnapCamera();
+  } else {
+    if (fractal_type != SEL_GAME) {
+      fractal_type = SEL_GAME;
+      shader_dirty = true;
+    }
+    drift_on = false;
+  }
   cam_mode = mode;
+}
+
+void Scene::SetFractal(const FractalDef& def) {
+  if (fractal_type != def.shader_sel) {
+    fractal_type = def.shader_sel;
+    shader_dirty = true;
+  }
+  frac_params = def.params;
+  frac_params_smooth = frac_params;
+  cam_pos = def.cam_pos;
+  cam_look_x = def.look_x;
+  cam_look_y = def.look_y;
+  drift_on = false;
+  drift_t = 0.0f;
+  SnapCamera();
+}
+
+//Live parameter editor: nudge one of the 9 fractal parameters
+void Scene::AdjustParam(int idx, float dir) {
+  if (idx < 0 || idx >= num_fractal_params) { return; }
+  static const float steps[num_fractal_params] = {
+    0.003f,                    // scale
+    0.006f, 0.006f,            // angles
+    0.010f, 0.010f, 0.010f,    // shift
+    0.008f, 0.008f, 0.008f     // color
+  };
+  frac_params[idx] += dir * steps[idx];
+  if (idx >= 6) {  // colors stay in [0,1]
+    frac_params[idx] = std::min(std::max(frac_params[idx], 0.0f), 1.0f);
+  }
+}
+
+void Scene::SetFlySpeedLevel(int level) {
+  if (level >= 0 && level <= 9) {
+    fly_speed_level = level;
+  }
 }
 
 int Scene::GetCountdownTime() const {
@@ -245,7 +329,7 @@ void Scene::UpdateCamera(float dx, float dy, float dz, bool speedup) {
   if (cam_mode == INTRO) {
     UpdateIntro(false);
   } else if (cam_mode == SCREEN_SAVER) {
-    UpdateIntro(true);
+    UpdateScreenSaver(dx, dy, dz);
   } else if (cam_mode == ORBIT) {
     for (int i = 0; i < iters; i++) {
       UpdateOrbit();
@@ -309,12 +393,12 @@ void Scene::UpdateMarble(float dx, float dy) {
     //Play bounce sound if needed
     float bounce_delta_v = max_delta_v / marble_rad;
     if (bounce_delta_v > 0.5f) {
-      sound_bounce1.play();
+      sound_bounce1->play();
     } else if (bounce_delta_v > 0.25f) {
-      sound_bounce2.play();
+      sound_bounce2->play();
     } else if (bounce_delta_v > 0.1f) {
-      sound_bounce3.setVolume(100.0f * (bounce_delta_v / 0.25f));
-      sound_bounce3.play();
+      sound_bounce3->setVolume(100.0f * (bounce_delta_v / 0.25f));
+      sound_bounce3->play();
     }
 
     //Add force from keyboard
@@ -351,7 +435,7 @@ void Scene::UpdateMarble(float dx, float dy) {
           high_scores.Update(cur_level, final_time);
         }
         SetMode(GOAL);
-        sound_goal.play();
+        sound_goal->play();
       }
     }
   }
@@ -408,6 +492,117 @@ void Scene::UpdateIntro(bool ssaver) {
     SnapCamera();
     intro_needs_snap = false;
   }
+}
+
+void Scene::UpdateScreenSaver(float dx, float dy, float dz) {
+  timer += 1;
+
+  //Same fractal animation as the intro screen saver
+  frac_params[0] = 1.6f;
+  frac_params[1] = 2.0f + 0.5f*std::cos(timer * 0.0021f);
+  frac_params[2] = pi + 0.5f*std::cos(timer * 0.000287f);
+  frac_params[3] = -4.0f + 0.5f*std::sin(timer * 0.00161f);
+  frac_params[4] = -1.0f + 0.1f*std::sin(timer * 0.00123f);
+  frac_params[5] = -1.0f + 0.1f*std::cos(timer * 0.00137f);
+  frac_params[6] = -0.2f;
+  frac_params[7] = -0.1f;
+  frac_params[8] = -0.6f;
+  frac_params_smooth = frac_params;
+
+  //Zoom with mouse wheel
+  cam_dist *= std::pow(2.0f, -dz);
+  cam_dist = std::min(std::max(cam_dist, 3.0f), 30.0f);
+  cam_dist_smooth = cam_dist_smooth*zoom_smooth + cam_dist*(1.0f - zoom_smooth);
+
+  //Rotate with mouse
+  cam_look_x += dx;
+  cam_look_y += dy;
+  cam_look_y = std::min(std::max(cam_look_y, -pi/2.0f), pi/2.0f);
+  while (cam_look_x >  pi) { cam_look_x -= 2.0f*pi; }
+  while (cam_look_x < -pi) { cam_look_x += 2.0f*pi; }
+  ModPi(cam_look_x_smooth, cam_look_x);
+  cam_look_x_smooth = cam_look_x_smooth*look_smooth + cam_look_x*(1.0f - look_smooth);
+  cam_look_y_smooth = cam_look_y_smooth*look_smooth + cam_look_y*(1.0f - look_smooth);
+
+  //Build camera matrix and position camera around fractal center
+  marble_mat.setIdentity();
+  MakeCameraRotation();
+  const Eigen::Vector3f look_target(0.0f, 3.0f, 0.0f);
+  cam_pos = look_target + cam_mat.block<3,3>(0,0) * Eigen::Vector3f(0.0f, 0.0f, cam_dist_smooth);
+  cam_pos_smooth = cam_pos;
+  cam_mat.block<3,1>(0,3) = cam_pos_smooth;
+
+  HideObjects();
+
+  if (intro_needs_snap) {
+    SnapCamera();
+    intro_needs_snap = false;
+  }
+}
+
+void Scene::UpdateFreeFlyCam(float look_dx, float look_dy, float move_lr, float move_ud, float move_fb, float sprint_mult, float zoom_delta) {
+  static const float fly_friction   = 0.82f;
+
+  //Advance the free-running clock (drives the 4D tesseract rotation)
+  anim_t += 1.0f / 60.0f;
+
+  //Fractal parameters: frozen, unless drift mode morphs them slowly
+  if (drift_on) {
+    drift_t += 1.0f / 60.0f;
+    frac_params_smooth = frac_params;
+    frac_params_smooth[1] += 0.10f * std::sin(drift_t * 0.31f);
+    frac_params_smooth[2] += 0.10f * std::sin(drift_t * 0.23f + 1.7f);
+    frac_params_smooth[3] += 0.05f * std::sin(drift_t * 0.17f + 0.5f);
+    frac_params_smooth[4] += 0.05f * std::sin(drift_t * 0.13f + 2.1f);
+    frac_params_smooth[5] += 0.05f * std::sin(drift_t * 0.11f + 4.2f);
+  } else {
+    frac_params_smooth = frac_params;
+  }
+
+  //Look direction — instantaneous response for FPS feel
+  cam_look_x += look_dx;
+  cam_look_y += look_dy;
+  cam_look_y = std::min(std::max(cam_look_y, -pi/2.0f), pi/2.0f);
+  while (cam_look_x >  pi) { cam_look_x -= 2.0f*pi; }
+  while (cam_look_x < -pi) { cam_look_x += 2.0f*pi; }
+  cam_look_x_smooth = cam_look_x;
+  cam_look_y_smooth = cam_look_y;
+
+  //Build camera matrix
+  marble_mat.setIdentity();
+  MakeCameraRotation();
+
+  //Movement: accelerate toward target velocity, then friction
+  Eigen::Vector3f move_input(move_lr, move_ud, -move_fb);
+  if (move_input.norm() > 1.0f) { move_input.normalize(); }
+  const Eigen::Vector3f move_world = cam_mat.block<3,3>(0,0) * move_input;
+  //Distance to the fractal surface drives auto speed AND adaptive detail
+  const float d_cam = std::max(DE_Fly(cam_pos), 1e-8f);
+
+  //Raise fold iterations as the camera closes in, so new detail keeps
+  //appearing the deeper you go (up to the float precision limit)
+  fly_iters = std::min(48, std::max(24, 24 + (int)(8.0f * std::log10(0.02f / d_cam))));
+
+  float base_speed;
+  if (fly_speed_level == 0) {
+    //AUTO: scale with distance to the fractal surface — slower the closer you get
+    base_speed = std::min(std::max(d_cam * auto_speed_factor, auto_speed_min), auto_speed_max);
+  } else {
+    base_speed = FLY_SPEEDS[fly_speed_level];
+  }
+  const float speed = base_speed * sprint_mult;
+  const Eigen::Vector3f target_vel = move_world * speed;
+  fly_vel = fly_vel * fly_friction + target_vel * (1.0f - fly_friction);
+
+  //Zoom: scroll wheel narrows/widens FOV (like a lens), range 5°–170°
+  fly_fov_vel = fly_fov_vel * 0.80f - zoom_delta * 12.0f;
+  fly_fov = std::max(5.0f, std::min(170.0f, fly_fov + fly_fov_vel));
+
+  cam_pos += fly_vel;
+  cam_pos_smooth = cam_pos;
+  cam_mat.block<3,1>(0,3) = cam_pos_smooth;
+
+  HideObjects();
 }
 
 void Scene::UpdateOrbit() {
@@ -653,6 +848,16 @@ void Scene::Write(sf::Shader& shader) const {
   shader.setUniform("iFracCol", sf::Glsl::Vec3(frac_params_smooth[6], frac_params_smooth[7], frac_params_smooth[8]));
 
   shader.setUniform("iExposure", exposure);
+
+  // FOV: use fly_fov in FREE_FLY, default 60° (= original √3 focal dist) elsewhere
+  const float fov_to_use = (cam_mode == FREE_FLY) ? fly_fov : 60.0f;
+  shader.setUniform("iFov", fov_to_use);
+
+  // Fold iterations: adaptive in free-fly, the original 24 everywhere else
+  shader.setUniform("iFracIter", (cam_mode == FREE_FLY) ? fly_iters : 24);
+
+  // Free-running clock for time-based objects (4D tesseract rotation)
+  shader.setUniform("iTime", anim_t);
 }
 
 //Hard-coded to match the fractal
@@ -694,6 +899,237 @@ float Scene::DE(const Eigen::Vector3f& pt) const {
   }
   const Eigen::Vector3f a = p.segment<3>(0).cwiseAbs() - Eigen::Vector3f(6.0f, 6.0f, 6.0f);
   return (std::min(std::max(std::max(a.x(), a.y()), a.z()), 0.0f) + a.cwiseMax(0.0f).norm()) / p.w();
+}
+
+//CPU mirror of the free-fly shader DEs. Only drives the adaptive fly speed,
+//so a rough estimate is fine — each formula matches its GLSL counterpart.
+float Scene::DE_Fly(const Eigen::Vector3f& pt) const {
+  typedef Eigen::Vector3f V3;
+  const float s = frac_params_smooth[0];
+  const V3 shift = frac_params_smooth.segment<3>(3);
+  const auto fract = [](float x) { return x - std::floor(x); };
+
+  switch (fractal_type) {
+  case SEL_SIERPINSKI: {
+    Eigen::Vector4f p; p << pt, 1.0f;
+    for (int i = 0; i < fractal_iters; ++i) {
+      float a;
+      a = std::min(p.x() + p.y(), 0.0f); p.x() -= a; p.y() -= a;
+      a = std::min(p.x() + p.z(), 0.0f); p.x() -= a; p.z() -= a;
+      a = std::min(p.y() + p.z(), 0.0f); p.y() -= a; p.z() -= a;
+      p *= s;
+      p.segment<3>(0) += shift;
+    }
+    const float md = std::max(std::max(-p.x() - p.y() - p.z(), p.x() + p.y() - p.z()),
+                              std::max(-p.x() + p.y() + p.z(), p.x() - p.y() + p.z()));
+    return (md - 1.0f) / (p.w() * 1.7320508f);
+  }
+  case SEL_MANDELBOX:
+  case SEL_MBOX_JULIA: {
+    V3 p = pt;
+    const V3 c = (fractal_type == SEL_MANDELBOX) ? V3(pt + shift) : shift;
+    float dr = 1.0f;
+    for (int i = 0; i < fractal_iters; ++i) {
+      p = p.cwiseMin(1.0f).cwiseMax(-1.0f) * 2.0f - p;
+      const float r2 = p.squaredNorm();
+      if (r2 < 0.25f) { p *= 4.0f; dr *= 4.0f; }
+      else if (r2 < 1.0f) { p /= r2; dr /= r2; }
+      p = p * s + c;
+      dr = dr * std::abs(s) + 1.0f;
+    }
+    return (p.norm() - std::abs(std::abs(s) - 1.0f)) / dr;
+  }
+  case SEL_OCTAHEDRAL: {
+    Eigen::Vector4f p; p << pt, 1.0f;
+    const V3 n1(0.7071f, 0.7071f, 0.0f), n2(0.7071f, 0.0f, 0.7071f), n3(0.0f, 0.7071f, 0.7071f);
+    for (int i = 0; i < fractal_iters; ++i) {
+      V3 q = p.segment<3>(0).cwiseAbs();
+      q -= 2.0f * std::min(0.0f, q.dot(n1)) * n1;
+      q -= 2.0f * std::min(0.0f, q.dot(n2)) * n2;
+      q -= 2.0f * std::min(0.0f, q.dot(n3)) * n3;
+      p.segment<3>(0) = q * s + shift;
+      p.w() *= s;
+    }
+    const float md = std::max(std::max(-p.x() - p.y() - p.z(), p.x() + p.y() - p.z()),
+                              std::max(-p.x() + p.y() + p.z(), p.x() - p.y() + p.z()));
+    return (md - 1.0f) / (p.w() * 1.7320508f);
+  }
+  case SEL_QUAT_JULIA: {
+    Eigen::Vector4f z(pt.x(), pt.y(), pt.z(), 0.0f);
+    const Eigen::Vector4f c(shift.x(), shift.y(), shift.z(), frac_params_smooth[1]);
+    Eigen::Vector4f dz(1.0f, 0.0f, 0.0f, 0.0f);
+    float r2 = 1.0f;
+    for (int i = 0; i < fractal_iters; ++i) {
+      const Eigen::Vector4f zq = z, dq = dz;
+      dz = 2.0f * Eigen::Vector4f(
+        zq.x()*dq.x() - zq.y()*dq.y() - zq.z()*dq.z() - zq.w()*dq.w(),
+        zq.x()*dq.y() + zq.y()*dq.x() + zq.z()*dq.w() - zq.w()*dq.z(),
+        zq.x()*dq.z() - zq.y()*dq.w() + zq.z()*dq.x() + zq.w()*dq.y(),
+        zq.x()*dq.w() + zq.y()*dq.z() - zq.z()*dq.y() + zq.w()*dq.x());
+      z = Eigen::Vector4f(zq.x()*zq.x() - zq.y()*zq.y() - zq.z()*zq.z() - zq.w()*zq.w(),
+                          2.0f*zq.x()*zq.y(), 2.0f*zq.x()*zq.z(), 2.0f*zq.x()*zq.w()) + c;
+      r2 = z.squaredNorm();
+      if (r2 > 4.0f) { break; }
+    }
+    const float dr2 = std::max(dz.squaredNorm(), 1e-12f);
+    return 0.5f * std::sqrt(r2 / dr2) * std::log(std::max(r2, 1.001f));
+  }
+  case SEL_MANDELBULB:
+  case SEL_JULIABULB: {
+    const float n = s;
+    const bool julia = (fractal_type == SEL_JULIABULB);
+    V3 z = pt;
+    float dr = 1.0f, r = z.norm();
+    for (int i = 0; i < fractal_iters; ++i) {
+      r = z.norm();
+      if (r > 2.0f) { break; }
+      const float theta = std::acos(std::min(std::max(z.z() / std::max(r, 1e-12f), -1.0f), 1.0f)) * n;
+      const float phi = std::atan2(z.y(), z.x()) * n;
+      dr = std::pow(r, n - 1.0f) * n * dr + (julia ? 0.0f : 1.0f);
+      const float zr = std::pow(r, n);
+      z = zr * V3(std::sin(theta)*std::cos(phi), std::sin(phi)*std::sin(theta), std::cos(theta));
+      z += julia ? shift : pt;
+    }
+    r = z.norm();
+    return 0.5f * std::log(std::max(r, 1e-6f)) * r / std::max(dr, 1e-9f);
+  }
+  case SEL_ICOSA: {
+    Eigen::Vector4f p; p << pt, 1.0f;
+    const float phi_g = 1.6180339887f, ni = 0.52573111f;
+    const V3 k1(ni, phi_g*ni, 0.0f), k2(0.0f, ni, phi_g*ni), k3(phi_g*ni, 0.0f, ni);
+    for (int i = 0; i < fractal_iters; ++i) {
+      V3 q = p.segment<3>(0).cwiseAbs();
+      float d;
+      d = q.dot(k1); if (d < 0.0f) { q -= 2.0f*d*k1; }
+      d = q.dot(k2); if (d < 0.0f) { q -= 2.0f*d*k2; }
+      d = q.dot(k3); if (d < 0.0f) { q -= 2.0f*d*k3; }
+      d = q.dot(k1); if (d < 0.0f) { q -= 2.0f*d*k1; }
+      d = q.dot(k2); if (d < 0.0f) { q -= 2.0f*d*k2; }
+      p.segment<3>(0) = q * s + shift;
+      p.w() *= s;
+    }
+    return (p.segment<3>(0).norm() - 1.0f) / p.w();
+  }
+  case SEL_APOLLONIAN: {
+    V3 p = pt;
+    float scale = 1.0f;
+    for (int i = 0; i < 10; ++i) {
+      p.x() = -1.0f + 2.0f*fract(0.5f*p.x() + 0.5f);
+      p.y() = -1.0f + 2.0f*fract(0.5f*p.y() + 0.5f);
+      p.z() = -1.0f + 2.0f*fract(0.5f*p.z() + 0.5f);
+      const float r2 = std::max(p.squaredNorm(), 1e-12f);
+      const float k = s / r2;
+      p *= k; scale *= k;
+    }
+    return 0.25f * std::abs(p.y()) / scale;
+  }
+  case SEL_KLEINIAN: {
+    const V3 csize = shift.cwiseAbs();
+    V3 p = pt;
+    float scale = 1.0f;
+    for (int i = 0; i < 10; ++i) {
+      p = 2.0f*p.cwiseMin(csize).cwiseMax(-csize) - p;
+      const float r2 = std::max(p.squaredNorm(), 1e-12f);
+      const float k = std::max(s / r2, 1.0f);
+      p *= k; scale *= k;
+    }
+    return 0.45f * std::abs(p.y()) / scale;
+  }
+  case SEL_MENGER_MBOX: {
+    Eigen::Vector4f p; p << pt, 1.0f;
+    for (int i = 0; i < 12; ++i) {
+      p.segment<3>(0) = p.segment<3>(0).cwiseAbs();
+      float a = std::min(p.x() - p.y(), 0.0f); p.x() -= a; p.y() += a;
+      a = std::min(p.x() - p.z(), 0.0f); p.x() -= a; p.z() += a;
+      a = std::min(p.y() - p.z(), 0.0f); p.y() -= a; p.z() += a;
+      p.segment<3>(0) = p.segment<3>(0).cwiseMin(1.0f).cwiseMax(-1.0f)*2.0f - p.segment<3>(0);
+      const float r2 = p.segment<3>(0).squaredNorm();
+      if (r2 < 0.25f) { p *= 4.0f; }
+      else if (r2 < 1.0f) { p /= r2; }
+      p *= s;
+      p.segment<3>(0) += shift;
+    }
+    const V3 a = p.segment<3>(0).cwiseAbs() - V3(6.0f, 6.0f, 6.0f);
+    return (std::min(std::max(std::max(a.x(), a.y()), a.z()), 0.0f) + a.cwiseMax(0.0f).norm()) / p.w();
+  }
+  case SEL_TESSERACT: {
+    //Mirror of tessVert + 32-edge min in frag.glsl
+    const V3 q = pt / s;
+    const float t = anim_t;
+    const float a1 = t * 0.37f * frac_params_smooth[1];
+    const float a2 = t * 0.29f * frac_params_smooth[2];
+    const float a3 = t * 0.21f;
+    const float a4 = t * 0.15f;
+    const float s1 = std::sin(a1), c1 = std::cos(a1);
+    const float s2 = std::sin(a2), c2 = std::cos(a2);
+    const float s3 = std::sin(a3), c3 = std::cos(a3);
+    const float s4 = std::sin(a4), c4 = std::cos(a4);
+    const float wd = std::max(3.0f + frac_params_smooth[3], 2.2f);
+    V3 V[16];
+    for (int i = 0; i < 16; ++i) {
+      float x = (i & 1) ? 1.0f : -1.0f;
+      float y = (i & 2) ? 1.0f : -1.0f;
+      float z = (i & 4) ? 1.0f : -1.0f;
+      float w = (i & 8) ? 1.0f : -1.0f;
+      float nx = c1*x - s1*w, nw = c1*w + s1*x; x = nx; w = nw;   // rotXW
+      float ny = c2*y - s2*w; nw = c2*w + s2*y; y = ny; w = nw;   // rotYW
+      float nz = c3*z - s3*w; nw = c3*w + s3*z; z = nz; w = nw;   // rotZW
+      nx = c4*x + s4*y; ny = c4*y - s4*x; x = nx; y = ny;         // rotZ (xy)
+      const float pr = wd / (wd - w);
+      V[i] = V3(x, y, z) * pr;
+    }
+    const float r = 0.03f;
+    float d = 1e9f;
+    for (int i = 0; i < 16; ++i) {
+      for (int k = 0; k < 4; ++k) {
+        const int j = i ^ (1 << k);
+        if (j <= i) { continue; }
+        const V3 pa = q - V[i], ba = V[j] - V[i];
+        const float h = std::min(std::max(pa.dot(ba) / std::max(ba.dot(ba), 1e-8f), 0.0f), 1.0f);
+        d = std::min(d, (pa - ba*h).norm() - r);
+      }
+    }
+    return d * s;
+  }
+  case SEL_MOBIUS: {
+    const V3 q = pt / s;
+    const float ang = std::atan2(q.y(), q.x());
+    const float rad = std::sqrt(q.x()*q.x() + q.y()*q.y()) - 1.0f;
+    const float ca = std::cos(ang*0.5f), sa = std::sin(ang*0.5f);
+    const float u =  ca*rad + sa*q.z();
+    const float v = -sa*rad + ca*q.z();
+    const float dx = std::abs(u) - frac_params_smooth[1];
+    const float dy = std::abs(v) - frac_params_smooth[2];
+    const float mx = std::max(dx, 0.0f), my = std::max(dy, 0.0f);
+    const float d = std::sqrt(mx*mx + my*my) + std::min(std::max(dx, dy), 0.0f);
+    return d * s * 0.7f;
+  }
+  case SEL_KLEIN: {
+    const V3 q = pt / s;
+    V3 bp = q - V3(0.0f, -0.2f, 0.0f);
+    bp.y() *= 0.85f;
+    const float bulb = std::abs(bp.norm() - 0.9f) - 0.05f;
+    const float tr = frac_params_smooth[2];
+    const float hk = frac_params_smooth[1];
+    const V3 A(0.0f, 0.62f, 0.0f), B(0.0f, 1.50f, 0.0f), C(hk, 1.70f, 0.0f),
+             E(hk, 0.20f, 0.0f), F(hk*0.2f, -0.55f, 0.0f);
+    const auto seg = [&](const V3& a, const V3& b) {
+      const V3 pa = q - a, ba = b - a;
+      const float h = std::min(std::max(pa.dot(ba) / std::max(ba.dot(ba), 1e-8f), 0.0f), 1.0f);
+      return (pa - ba*h).norm() - tr;
+    };
+    float neck = seg(A, B);
+    neck = std::min(neck, seg(B, C));
+    neck = std::min(neck, seg(C, E));
+    neck = std::min(neck, seg(E, F));
+    const float k = 0.08f;
+    const float hh = std::min(std::max(0.5f + 0.5f*(neck - bulb)/k, 0.0f), 1.0f);
+    const float d = (neck*(1.0f - hh) + bulb*hh) - k*hh*(1.0f - hh);
+    return d * s;
+  }
+  default:
+    return DE(pt);  // game formula (levels, sponge variants)
+  }
 }
 
 //Hard-coded to match the fractal
@@ -793,7 +1229,7 @@ bool Scene::MarbleCollision(float& delta_v) {
   
   //Check if the marble has been crushed by the fractal
   if (de < marble_rad * 0.001f) {
-    sound_shatter.play();
+    sound_shatter->play();
     marble_pos.y() = -9999.0f;
     return false;
   }

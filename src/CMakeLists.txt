@@ -1,4 +1,8 @@
 add_library(MarbleMarcherSources
+  Explorer2D.cpp
+  Explorer2D.h
+  Fractals.cpp
+  Fractals.h
   Level.cpp
   Level.h
   Overlays.cpp

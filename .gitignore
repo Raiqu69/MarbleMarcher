@@ -2,3 +2,11 @@
 .DS_Store
 build
 src/resources.c*
+
+# IDE / editor / tooling
+.idea/
+src/.idea/
+.claude/
+
+# AI session working notes (not part of the game)
+context.md
