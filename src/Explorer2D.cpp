@@ -153,14 +153,15 @@ static const int REF2_ENTRY_OFF = 9216;
 static const double perturb_threshold = 1e-4;
 
 // Zoom limits per kind:
-//  - Mandelbrot / Sierpinski triangle / carpet: ~1e-95 (384-bit CPU precision)
+//  - Mandelbrot / Sierpinski triangle / carpet / Koch: ~1e-95 (384-bit CPU precision)
+//  - Newton: ~1e-90 (perturbation, reference orbit in 384-bit)
 //  - Julia: ~1e-60 (limited by reference orbit slots in the texture)
 //  - Burning Ship / Tricorn: ~1e-13 (emulated double precision)
-//  - Newton / Koch: ~2e-5 (plain float)
 static double MinZoom(int kind) {
-  if (kind == KIND_MANDELBROT || kind == KIND_SIERPINSKI_TRI || kind == KIND_CARPET) { return 1e-95; }
+  if (kind == KIND_MANDELBROT || kind == KIND_SIERPINSKI_TRI || kind == KIND_CARPET ||
+      kind == KIND_KOCH) { return 1e-95; }
+  if (kind == KIND_NEWTON) { return 1e-90; }
   if (kind == KIND_JULIA) { return 1e-60; }
-  if (kind == KIND_NEWTON || kind == KIND_KOCH) { return 2e-5; }
   return 1e-13;
 }
 static const double max_zoom = 4.0;
@@ -187,6 +188,20 @@ static BigFixed MakeInvSqrt3() {
   return y;
 }
 
+// Reciprocal of a positive BigFixed via Newton-Raphson r' = r*(2 - b*r), seeded
+// from the double reciprocal (only Mul/Add, same quadratic scheme as above).
+// The caller must keep b away from 0 (result overflows the 32 integer bits when
+// 1/b >= 2^32). Used by the Newton-fractal reference orbit (complex division).
+static BigFixed BF_Recip(const BigFixed& b) {
+  BigFixed r = BigFixed::FromDouble(1.0 / b.ToDouble());
+  const BigFixed two = BigFixed::FromDouble(2.0);
+  for (int it = 0; it < 6; ++it) {
+    const BigFixed t = BigFixed::Add(two, BigFixed::Mul(b, r).Neg());  // 2 - b*r
+    r = BigFixed::Mul(r, t);
+  }
+  return r;
+}
+
 Explorer2D::Explorer2D() :
   kind(KIND_MANDELBROT),
   palette(0),
@@ -202,7 +217,9 @@ Explorer2D::Explorer2D() :
   ref_count2(0),
   ifs_sx(0.0), ifs_sy(0.0),
   ifs_scale(1.0),
-  ifs_skip(0) {
+  ifs_skip(0),
+  koch_deep(false) {
+  koch_mat[0] = 1.0; koch_mat[1] = 0.0; koch_mat[2] = 0.0; koch_mat[3] = 1.0;
   hp_cx = BigFixed::FromDouble(cx);
   hp_cy = BigFixed::FromDouble(cy);
 }
@@ -299,19 +316,23 @@ void Explorer2D::Update(float mx_frac, float my_frac, bool lmb, float wheel,
 }
 
 int Explorer2D::PrecisionMode() const {
-  if (kind == KIND_NEWTON || kind == KIND_KOCH) { return 0; }
+  // Sierpinski / carpet / Koch use the CPU-assisted skip once they have zoomed
+  // in far enough that the deep path engages.
+  if (kind == KIND_SIERPINSKI_TRI || kind == KIND_CARPET || kind == KIND_KOCH) {
+    return (zoom < perturb_threshold) ? 2 : 0;
+  }
   if (zoom >= perturb_threshold) { return 0; }
   if (kind == KIND_BURNING_SHIP || kind == KIND_TRICORN) { return 1; }
-  return 2;  // mandelbrot/julia perturbation, sierpinski/carpet CPU-assisted
+  return 2;  // mandelbrot/julia/newton perturbation, sierpinski/carpet CPU-assisted
 }
 
 int Explorer2D::Iters() const {
   const double depth = std::log10(std::max(base_zoom / zoom, 1.0));
   switch (kind) {
-  case KIND_NEWTON:          return 64;
+  case KIND_NEWTON:          return std::min(4000, 64 + (int)(depth * 120.0));  // perturbation, boundary is slow
   case KIND_SIERPINSKI_TRI:  return std::min(360, 14 + (int)(depth * 3.4));  // features halve per iter
   case KIND_CARPET:          return std::min(240, 10 + (int)(depth * 2.2));  // features third per iter
-  case KIND_KOCH:            return std::min(44, 6 + (int)(depth * 2.2));
+  case KIND_KOCH:            return std::min(400, 40 + (int)(depth * 3.4));  // features third per iter (skip-assisted)
   case KIND_MANDELBROT:      return std::min(20000, 96 + (int)(depth * 130.0));
   case KIND_JULIA:           return std::min(9000, 96 + (int)(depth * 130.0));
   default:                   return std::min(2000, 96 + (int)(depth * 130.0));
@@ -333,6 +354,56 @@ void Explorer2D::ComputeReference() {
     p[2] = (std::uint8_t)((bits >> 16) & 0xFF);
     p[3] = (std::uint8_t)((bits >> 24) & 0xFF);
   };
+
+  // Newton fractal z^3-1: iterate z <- N(z) = (2z^3+1)/(3z^2) from the view
+  // center, storing one orbit (like Mandelbrot). Complex division needs a
+  // BigFixed reciprocal; the orbit stops when it converges to a root or flies
+  // out near the pole (z ~ 0).
+  if (kind == KIND_NEWTON) {
+    BigFixed zx = hp_cx, zy = hp_cy;
+    const BigFixed one = BigFixed::FromDouble(1.0);
+    const BigFixed three = BigFixed::FromDouble(3.0);
+    const int max_n = REF_MAX_ORBIT - 2;
+    int count = 0;
+    for (int n = 0; n < max_n; ++n) {
+      const double dx = zx.ToDouble();
+      const double dy = zy.ToDouble();
+      pack_float(2*n,     (float)dx);
+      pack_float(2*n + 1, (float)dy);
+      count = n + 1;
+      const double r0 = std::hypot(dx - 1.0, dy);
+      const double r1 = std::hypot(dx + 0.5, dy - 0.8660254037844386);
+      const double r2 = std::hypot(dx + 0.5, dy + 0.8660254037844386);
+      if (std::min(r0, std::min(r1, r2)) < 1e-6) { break; }  // converged to a root
+      if (dx*dx + dy*dy > 1e12) { break; }                   // flew out near the pole
+      // z^2 and z^3
+      const BigFixed x2  = BigFixed::Mul(zx, zx);
+      const BigFixed y2  = BigFixed::Mul(zy, zy);
+      const BigFixed xy  = BigFixed::Mul(zx, zy);
+      const BigFixed re2 = BigFixed::Add(x2, y2.Neg());                 // Re(z^2)
+      const BigFixed im2 = BigFixed::Add(xy, xy);                       // Im(z^2)
+      const BigFixed re3 = BigFixed::Add(BigFixed::Mul(re2, zx), BigFixed::Mul(im2, zy).Neg());
+      const BigFixed im3 = BigFixed::Add(BigFixed::Mul(re2, zy), BigFixed::Mul(im2, zx));
+      // numerator N = 2 z^3 + 1, denominator D = 3 z^2
+      const BigFixed nx  = BigFixed::Add(BigFixed::Add(re3, re3), one);
+      const BigFixed ny  = BigFixed::Add(im3, im3);
+      const BigFixed dxr = BigFixed::Mul(three, re2);
+      const BigFixed dyr = BigFixed::Mul(three, im2);
+      const BigFixed d2  = BigFixed::Add(BigFixed::Mul(dxr, dxr), BigFixed::Mul(dyr, dyr));
+      if (d2.ToDouble() < 1e-12) { break; }                            // pole: |D| ~ 0
+      const BigFixed inv = BF_Recip(d2);
+      // z' = N / D = N * conj(D) * (1/|D|^2)
+      const BigFixed ncx = BigFixed::Add(BigFixed::Mul(nx, dxr), BigFixed::Mul(ny, dyr));
+      const BigFixed ncy = BigFixed::Add(BigFixed::Mul(ny, dxr), BigFixed::Mul(nx, dyr).Neg());
+      zx = BigFixed::Mul(ncx, inv);
+      zy = BigFixed::Mul(ncy, inv);
+    }
+    ref_count = count;
+    ref_count2 = 0;
+    ref_tex.update(ref_pixels.data());
+    return;
+  }
+
   const bool is_julia = (kind == KIND_JULIA);
   const BigFixed bcx = is_julia ? BigFixed::FromDouble((double)jc_x) : hp_cx;
   const BigFixed bcy = is_julia ? BigFixed::FromDouble((double)jc_y) : hp_cy;
@@ -426,7 +497,7 @@ void Explorer2D::ComputeIfsSkip() {
     }
     ifs_sx = fx.ToDouble();
     ifs_sy = fy.ToDouble();
-  } else {  // KIND_CARPET
+  } else if (kind == KIND_CARPET) {
     BigFixed fx = hp_cx, fy = hp_cy;
     while (K < 230) {
       if (std::fabs(fx.ToDouble()) > 0.5 || std::fabs(fy.ToDouble()) > 0.5) { break; }
@@ -450,15 +521,95 @@ void Explorer2D::ComputeIfsSkip() {
     }
     ifs_sx = fx.ToDouble();
     ifs_sy = fy.ToDouble();
+  } else {  // KIND_KOCH
+    // Replicate the frag2d.glsl Koch construction: a fixed pre-transform
+    // (abs + one wedge reflection + shifts) then a x3 fold loop with an abs
+    // and a reflection each step. Every step is affine-per-branch, like
+    // Sierpinski — but the folds REFLECT, so we also accumulate the orthogonal
+    // frame R (koch_mat) that the shader applies to the on-screen delta. The
+    // branch-dependent pre-transform can only be pre-applied when the screen
+    // stays within one branch of it (else koch_deep=false -> shader full path).
+    static const BigFixed invsqrt3 = MakeInvSqrt3();
+    static const BigFixed s3     = BigFixed::Mul(BigFixed::FromDouble(3.0), invsqrt3);  // sqrt(3)
+    static const BigFixed s3half = BigFixed::Mul(s3, BigFixed::FromDouble(0.5));        // sqrt(3)/2
+    static const BigFixed shift  = BigFixed::Mul(invsqrt3, BigFixed::FromDouble(0.5));  // 1/(2 sqrt3)
+    const BigFixed half  = BigFixed::FromDouble(0.5);
+    const BigFixed nhalf = BigFixed::FromDouble(-0.5);
+    const double   S3 = 0.8660254037844386;
+    const double   SAFE = 2.2;  // full diagonal (~2.2 * half-diagonal) must clear the boundary
+
+    auto tri = [](const BigFixed& x) { return BigFixed::Add(BigFixed::Add(x, x), x); };
+    // Left-multiply koch_mat by the 2x2 [[a,b],[c,d]] (accumulate the fold frame)
+    auto premul = [&](double a, double b, double c, double d) {
+      const double n00 = a*koch_mat[0] + b*koch_mat[2];
+      const double n01 = a*koch_mat[1] + b*koch_mat[3];
+      const double n10 = c*koch_mat[0] + d*koch_mat[2];
+      const double n11 = c*koch_mat[1] + d*koch_mat[3];
+      koch_mat[0] = n00; koch_mat[1] = n01; koch_mat[2] = n10; koch_mat[3] = n11;
+    };
+    koch_mat[0] = 1.0; koch_mat[1] = 0.0; koch_mat[2] = 0.0; koch_mat[3] = 1.0;
+    koch_deep = false;
+
+    BigFixed fx = hp_cx, fy = hp_cy;
+    bool ok = true;
+    // (A) x -> |x|  (boundary x=0)
+    if (std::fabs(fx.ToDouble()) <= r * SAFE) { ok = false; }
+    else {
+      const double s = (fx.sign < 0) ? -1.0 : 1.0;
+      if (fx.sign < 0) { fx = fx.Neg(); }
+      premul(s, 0.0, 0.0, 1.0);
+    }
+    // (B) y -= 1/(2 sqrt3)
+    if (ok) { fy = BigFixed::Add(fy, shift.Neg()); }
+    // (C)(D) reflect across the wedge line through (0.5,0), normal (0.5,-sqrt3/2)
+    if (ok) {
+      const BigFixed dd = BigFixed::Add(BigFixed::Mul(BigFixed::Add(fx, nhalf), half),
+                                        BigFixed::Mul(fy, s3half.Neg()));
+      if (std::fabs(dd.ToDouble()) <= r * SAFE) { ok = false; }
+      else if (dd.ToDouble() > 0.0) {
+        fx = BigFixed::Add(fx, dd.Neg());          // fx -= dd
+        fy = BigFixed::Add(fy, BigFixed::Mul(dd, s3));  // fy += dd*sqrt3
+        premul(0.5, S3, S3, -0.5);                 // Ref(nrm1)
+      }
+    }
+    // (E) x += 0.5
+    if (ok) { fx = BigFixed::Add(fx, half); }
+
+    if (ok) {
+      koch_deep = true;
+      while (K < 200) {
+        const BigFixed gx = BigFixed::Add(tri(fx), BigFixed::FromDouble(-1.5));  // 3fx - 1.5
+        const BigFixed gy = tri(fy);
+        const double r3 = 3.0 * r;
+        // (H) x -> |x| - 0.5  (boundary gx=0)
+        if (std::fabs(gx.ToDouble()) <= r3 * SAFE) { break; }
+        const double sh = (gx.sign < 0) ? -1.0 : 1.0;
+        BigFixed hx = BigFixed::Add((gx.sign < 0) ? gx.Neg() : gx, nhalf);  // |gx| - 0.5
+        BigFixed hy = gy;
+        // (I) reflect across line normal (sqrt3/2,-0.5) (boundary val=0)
+        const BigFixed val = BigFixed::Add(BigFixed::Mul(hx, s3half), BigFixed::Mul(hy, nhalf));
+        if (std::fabs(val.ToDouble()) <= r3 * SAFE) { break; }
+        premul(sh, 0.0, 0.0, 1.0);  // diag(sh,1)
+        if (val.ToDouble() < 0.0) {
+          hx = BigFixed::Add(hx, BigFixed::Mul(val, s3).Neg());  // hx -= val*sqrt3
+          hy = BigFixed::Add(hy, val);                           // hy += val
+          premul(-0.5, S3, S3, 0.5);                             // Ref(nrm2)
+        }
+        fx = hx; fy = hy; r = r3; ++K;
+      }
+    }
+    ifs_sx = fx.ToDouble();
+    ifs_sy = fy.ToDouble();
   }
   ifs_scale = r / diag;  // = zoom * 2^K (or 3^K)
   ifs_skip = K;
 }
 
 void Explorer2D::Write() {
-  const bool perturb = ((kind == KIND_MANDELBROT || kind == KIND_JULIA) &&
-                        zoom < perturb_threshold);
-  const bool ifs_assist = (kind == KIND_SIERPINSKI_TRI || kind == KIND_CARPET);
+  const bool perturb = ((kind == KIND_MANDELBROT || kind == KIND_JULIA ||
+                         kind == KIND_NEWTON) && zoom < perturb_threshold);
+  const bool ifs_assist = (kind == KIND_SIERPINSKI_TRI || kind == KIND_CARPET ||
+                           kind == KIND_KOCH);
   if (ref_dirty && perturb) {
     ComputeReference();
     ref_dirty = false;
@@ -486,7 +637,14 @@ void Explorer2D::Write() {
   int iters_uniform = Iters();
   if (ifs_assist) {
     // The shader only iterates what the CPU skip left over
-    iters_uniform = std::min(std::max(iters_uniform - ifs_skip, 6), 90);
+    if (kind == KIND_KOCH) {
+      iters_uniform = std::min(std::max(iters_uniform - ifs_skip, 8), 48);
+      shader.setUniform("iKochDeep", koch_deep ? 1 : 0);
+      shader.setUniform("iKochMat", sf::Glsl::Vec4((float)koch_mat[0], (float)koch_mat[1],
+                                                   (float)koch_mat[2], (float)koch_mat[3]));
+    } else {
+      iters_uniform = std::min(std::max(iters_uniform - ifs_skip, 6), 90);
+    }
     shader.setUniform("iIfsStart", sf::Glsl::Vec2((float)ifs_sx, (float)ifs_sy));
     shader.setUniform("iIfsScale", (float)ifs_scale);
     shader.setUniform("iIfsSkip", ifs_skip);

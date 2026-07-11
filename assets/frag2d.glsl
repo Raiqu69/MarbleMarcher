@@ -35,6 +35,13 @@ uniform vec2 iIfsStart;    // center after the skipped iterations
 uniform float iIfsScale;   // zoom scaled up by the skipped iterations
 uniform int iIfsSkip;      // number of skipped iterations (for band coloring)
 
+// Koch deep zoom: the folds reflect, so the CPU also hands over the accumulated
+// orthogonal frame applied to the on-screen delta, plus a gate (the branch-
+// dependent pre-transform can only be pre-applied when the screen stays in one
+// branch; otherwise the shader runs the original full float path).
+uniform int iKochDeep;     // 1 = residual path active (pre-transform pre-applied)
+uniform vec4 iKochMat;     // 2x2 fold frame R (m00,m01,m10,m11)
+
 #define MAX_ITER_2D 2048
 #define MAX_ITER_IFS 96
 #define MAX_ITER_KOCH 48
@@ -119,7 +126,7 @@ void main() {
 	vec2 pos = vec2(iCenterX.x, iCenterY.x) + dxy;          // float approximation
 	vec3 col = vec3(0.0);
 
-	if (iKind == 3) {
+	if (iKind == 3 && iPerturb == 0) {
 		//Newton fractal for z^3 - 1: color by root basin, shade by convergence speed
 		vec2 z = pos;
 		float n = 0.0;
@@ -176,16 +183,33 @@ void main() {
 		col = (n < 0.0) ? vec3(0.95) : pal_col(n*0.045 + 0.06);
 
 	} else if (iKind == 7) {
-		//Koch snowflake: distance field via edge folds (float precision)
-		vec2 p = pos;
+		//Koch snowflake: distance field via edge folds.
+		vec2 nrm = vec2(0.8660254, -0.5);          // loop reflection normal
 		float scale = 1.0;
-		p.x = abs(p.x);
-		vec2 nrm = vec2(0.5, -0.8660254);          // fold into snowflake wedge
-		p.y -= 0.28867513;
-		float dd = dot(p - vec2(0.5, 0.0), nrm);
-		p -= nrm * max(0.0, dd) * 2.0;
-		nrm = vec2(0.8660254, -0.5);
-		p.x += 0.5;
+		vec2 p;
+		float pxs;
+		int skip = 0;
+		if (iKochDeep == 1) {
+			//Deep zoom: the CPU pre-applied the pre-transform + iIfsSkip folds and
+			//handed the residual position plus the orthogonal fold frame iKochMat.
+			//Everything below runs in the residual frame (distance measured there;
+			//the palette compensates the skipped 3^K scaling so colors stay stable).
+			vec2 duv = uv * iIfsScale;
+			p = iIfsStart + vec2(iKochMat.x*duv.x + iKochMat.y*duv.y,
+			                     iKochMat.z*duv.x + iKochMat.w*duv.y);
+			pxs = 2.0*iIfsScale / iResolution.y;
+			skip = iIfsSkip;
+		} else {
+			//Shallow zoom: original full float path (pre-transform then folds)
+			p = pos;
+			p.x = abs(p.x);
+			vec2 n1 = vec2(0.5, -0.8660254);       // fold into snowflake wedge
+			p.y -= 0.28867513;
+			float dd = dot(p - vec2(0.5, 0.0), n1);
+			p -= n1 * max(0.0, dd) * 2.0;
+			p.x += 0.5;
+			pxs = 2.0*iZoom / iResolution.y;
+		}
 		for (int i = 0; i < MAX_ITER_KOCH; ++i) {
 			if (i >= iIters) { break; }
 			p *= 3.0; scale *= 3.0;
@@ -194,9 +218,68 @@ void main() {
 			p -= nrm * min(0.0, dot(p, nrm)) * 2.0;
 		}
 		float d = length(p - vec2(clamp(p.x, -1.0, 1.0), 0.0)) / scale;
-		float pxs = 2.0*iZoom / iResolution.y;
-		col = mix(vec3(1.0), pal_col(log(d + 1e-20)*0.10 + 0.6)*0.8,
+		//log(world distance) = log(residual distance) - skip*log(3)
+		float logw = log(d + 1e-30) - float(skip)*1.0986123;
+		col = mix(vec3(1.0), pal_col(logw*0.10 + 0.6)*0.8,
 		          smoothstep(0.6*pxs, 1.8*pxs, d));
+
+	} else if (iPerturb == 1 && iKind == 3) {
+		//Newton z^3-1 deep zoom: reference orbit N(z) lives in the texture, each
+		//pixel tracks its delta u*2^E (no additive c-term, no rebasing). Colored
+		//by which root the full value z = Z + delta converges to.
+		vec2 u = uv * iZetaMan;      // delta_0 = uv * zoom
+		int E = iZetaExp;
+		int mi = 0;
+		int root = -1;
+		float sn = 0.0;
+		bool finish = false;
+		vec2 zf = vec2(0.0);
+		for (int i = 0; i < MAX_PERTURB_ITER; ++i) {
+			if (i >= iIters) { sn = float(i); break; }
+			vec2 Z = fetch_ref(mi);
+			float e2 = exp2(float(E));
+			vec2 z = Z + u*e2;       // full value (df underflows to 0 when very deep)
+			float q0 = dot(z - vec2( 1.0, 0.0),       z - vec2( 1.0, 0.0));
+			float q1 = dot(z - vec2(-0.5, 0.8660254), z - vec2(-0.5, 0.8660254));
+			float q2 = dot(z - vec2(-0.5,-0.8660254), z - vec2(-0.5,-0.8660254));
+			if (min(q0, min(q1, q2)) < 1e-8) {
+				root = (q0 < q1 && q0 < q2) ? 0 : ((q1 < q2) ? 1 : 2);
+				sn = float(i); break;
+			}
+			vec2 den = cmul(cmul(Z, Z), cmul(z, z));   // Z^2 * z^2
+			if (mi + 1 >= iRefCount || dot(den, den) < 1e-30) {
+				zf = z; sn = float(i); finish = true; break;
+			}
+			//exact delta map, u-form: u' = (2/3)u - (1/3)(2Zu + u^2 e2)/(Z^2 z^2)
+			vec2 numq = 2.0*cmul(Z, u) + cmul(u, u)*e2;
+			vec2 corr = vec2(numq.x*den.x + numq.y*den.y,
+			                 numq.y*den.x - numq.x*den.y) / dot(den, den);
+			u = (2.0/3.0)*u - (1.0/3.0)*corr;
+			mi += 1;
+			float L = max(abs(u.x), abs(u.y));
+			if (L > 0.0) { float sh = floor(log2(L)); u *= exp2(-sh); E += int(sh); }
+		}
+		if (finish && root < 0) {
+			//reference ran out (converged to a root, or a pole excursion): the fate
+			//of this pixel is decided in plain float from the reconstructed value
+			vec2 z = zf;
+			for (int j = 0; j < 80; ++j) {
+				vec2 z2 = cmul(z, z);
+				float dl = 9.0*dot(z2, z2);
+				if (dl < 1e-22) { break; }
+				vec2 num = cmul(z2, z) - vec2(1.0, 0.0);
+				vec2 de = 3.0*z2;
+				z -= vec2(dot(num, de), num.y*de.x - num.x*de.y) / dl;
+				float p0 = dot(z - vec2( 1.0, 0.0),       z - vec2( 1.0, 0.0));
+				float p1 = dot(z - vec2(-0.5, 0.8660254), z - vec2(-0.5, 0.8660254));
+				float p2 = dot(z - vec2(-0.5,-0.8660254), z - vec2(-0.5,-0.8660254));
+				if (min(p0, min(p1, p2)) < 1e-8) {
+					root = (p0 < p1 && p0 < p2) ? 0 : ((p1 < p2) ? 1 : 2); break;
+				}
+			}
+		}
+		col = (root < 0) ? vec3(0.0)
+		                 : pal_col(float(root)*0.3333 + 0.1) * clamp(1.1 - sn*0.02, 0.15, 1.0);
 
 	} else if (iPerturb == 1) {
 		//Deep zoom via perturbation (Mandelbrot & Julia): the CPU iterates a

@@ -92,8 +92,13 @@ private:
   std::vector<std::uint8_t> ref_pixels;
   sf::Texture ref_tex;
 
-  // CPU-assisted IFS deep zoom (Sierpinski triangle & carpet)
+  // CPU-assisted IFS deep zoom (Sierpinski triangle, carpet & Koch)
   double ifs_sx, ifs_sy;  // center after the skipped fold iterations
   double ifs_scale;       // zoom scaled up by the skipped iterations
   int    ifs_skip;        // number of skipped iterations
+  // Koch also carries the accumulated orthogonal fold frame (its folds reflect,
+  // unlike Sierpinski's translate-only folds) and a gate: the branch-dependent
+  // pre-transform can only be pre-applied when the screen stays within one branch.
+  double koch_mat[4];     // 2x2 frame R applied to the on-screen delta
+  bool   koch_deep;       // true = residual path active (pre-transform pre-applied)
 };
